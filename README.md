@@ -76,3 +76,117 @@ fd2num(struct Fd *fd)
 
 ##管道读写##
 在开始写这两个函数之前，我还去参考了一下unix系统中的管道实现，因为在今年上unix课时老师提到过父子进程的管道读写，所以记忆比较深刻。关于不命名管道的读写实际上是这样，使用`dup`函数将父子进程的标准输入或标准输出和管道的一端进行绑定，然后即可以顺利实现管道。
+但完全实现起来还是有困难，首先来看关于`pipe`的结构体：
+```C
+struct Pipe {
+        u_int p_rpos;           // read position
+        u_int p_wpos;           // write position
+        u_char p_buf[BY2PIPE];  // data buffer
+};
+```
+其中`p_rpos`是管道的读指针,`p_wpos`是管道的写指针,`p_buf`是管道的缓冲区，类似于一片小的缓冲区域。可惜我们的这个管道超小，只有32字节。
+下面来看关于`piperead`的实现：
+###piperead###
+```C
+static int
+piperead(struct Fd *fd, void *vbuf, u_int n, u_int offset)
+{
+        // Your code here.  See the lab text for a description of
+        // what piperead needs to do.  Write a loop that
+        // transfers one byte at a time.  If you decide you need
+        // to yield (because the pipe is empty), only yield if
+        // you have not yet copied any bytes.  (If you have copied
+        // some bytes, return what you have instead of yielding.)
+        // If the pipe is empty and closed and you didn't copy any data out, return 0.
+        // Use _pipeisclosed to check whether the pipe is closed.
+        int i;
+        struct Pipe *p;
+        char *rbuf;
+        p = (struct Pipe*)fd2data(fd);
+        rbuf = vbuf;
+
+        for(i = 0;i < n;i++){
+            while ( p->p_rpos >= p->p_wpos) {
+                if( i >0 )
+                    return i;
+                if(_pipeisclosed(fd,p))
+                    return 0;
+                syscall_yield();
+            }
+            rbuf[i] = p->p_buf[p->p_rpos % BY2PIPE];
+        //    writef("rbuf:%c\n",rbuf[i]);
+            p->p_rpos++;
+        }
+        return n;
+}
+```
+管道读函数首先是要获取所打开的管道，那么使用刚才使用过的`fd2data`可以解决这个问题。获取到文件描述符打开的管道后，我们需要从管道中读字节，即将管道中的字节读到`vbuf`中去，而且注意这过程中我们需要移动读指针。
+`  while ( p->p_rpos >= p->p_wpos) `当我们的读指针超过写指针时，即意味着要读一些未知之数，这样的话得到的数据是错误的，我选择直接返回`i`,这样一方面可以防止一开始的错误并传达错误信息，也可以在正常的情况末尾正确地返回`n`。在读的过程中我们需要判断管道是否关闭。同时如果读者是因为写者未写够而阻塞，则会一直调度写者，督促写者向管道中写入内容。  
+如果我们的读指针是有效的(<写指针),那么我们可以开始读写了，读比较简单，将管道`p`的缓冲区中的内容读到`rbuf`中即可。并且注意读指针的移动。最后我们要返回读取的字符串的长度以通过`testpipe`里的匹配测试(正常返回的标志)。  
+
+###pipewrite###
+```C
+static int
+pipewrite(struct Fd *fd, const void *vbuf, u_int n, u_int offset)
+{
+        int i;
+        struct Pipe *p;
+        char *wbuf;
+        p = (struct Pipe*)fd2data(fd);
+        wbuf = vbuf;
+        while(p->p_wpos - p->p_rpos >= BY2PIPE){
+            if(_pipeisclosed(fd,p))
+                return 0;
+            syscall_yield();
+        }
+        i = 0;
+        while(i<n){
+            p->p_buf[p->p_wpos % BY2PIPE] = wbuf[i];
+            p->p_wpos ++;
+            i++;
+            while((i<n) && (p->p_wpos - p->p_rpos>=BY2PIPE))
+                syscall_yield();
+            //When the p_buf is full and the message is not sent all.
+        }
+
+        return n;
+}
+```
+写者大部分的思路和读者是一致的，不同的一点是初始时判断写指针的位置有效性时，因为写者是创造者，所以它担心的是缓冲区溢出，所以我们要保证`p->p_wpos-p->p_rpos <= BY2PIPE`，所以如果`>=`则需要调度让读者去读。  
+注意这里如果写的字节没有够字符串的长度，写者不能自行退出，要被阻塞，需要写够字符串长度后才可结束。  
+
+其实这两个函数写完如果之前的`fork.c`里的`LIBRARY`权限位设置没有问题的话，就应该可以顺利通过`testpipe`的测试。而这两个函数只是微观上的管道读写，我们需要有宏观的读写来统一管道读写机制，即在`sh.c`中的补充内容。  
+
+##shell程序##
+那么我们只剩下`sh.c`需要被填写，填写这个函数，我所填如下：
+```C
+case '|':
+                        pipe(p);
+                        if((r=fork())<0)
+                            writef("fork error");
+                        else if(r==0){
+                            //in child
+                            dup(p[0],0);
+                            close(p[0]);
+                            close(p[1]);
+                            goto again;
+                        }
+                        else{
+                            dup(p[1],1);
+                            //close(p[0]);
+                            close(p[1]);
+                            close(p[0]);
+                            goto runit;
+                        }
+```
+这是要填写的部分，其实这部分流程也比较简单：  
+shell在fork之后，未命名管道实现机制如下:  
++ 父进程的控制的写文件复制到标准输出文件（1号文件）里
++ 子进程控制的读文件复制到标准输入文件（0号文件）
++ 然后各自解析命令并运行程序。
+其实这里的dup是映射，其实也是绑定的意思，在我们的实验中绑定这些即可。  
+
+##总结##
+其实lab6本身的内容并不是很难，难的地方在于之前的许多坑，比如`fork.c`,`pmap.c`,`syscall_all.c`,还有连着的`writef`的bug，许多的bug交织在一起，就会显得毫无调试头绪。
+
+2015/7/4 乾
